@@ -1,0 +1,10 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
+#
+# Better still, leave the password out of any file and export it instead:
+#   export TF_VAR_sql_admin_password='...'
+
+entra_admin_login     = "you@example.com"
+entra_admin_object_id = "00000000-0000-0000-0000-000000000000"
+client_ip_address     = "203.0.113.10"
+
+# sql_admin_password  = "..."   # prefer TF_VAR_sql_admin_password
