@@ -1,195 +1,251 @@
-# Azure Web App + SQL Lab
+# Azure Secure Web Application Environment
 
-A small but production-shaped Azure environment built by hand in the portal: a segmented virtual
-network, a serverless SQL database, secrets in Key Vault, and (pending quota) an App Service with
-private networking and a CI/CD pipeline.
+A hands-on lab building a segmented, credential-free Azure environment: a Linux web app that reaches
+an Azure SQL database over a private endpoint, with the database credential held in Key Vault and read
+by the app's own managed identity. Built in the portal to learn the moving parts, then expressed as
+Terraform.
 
-Built as self-directed study alongside AZ-104 preparation. Region: **UK South**.
-
-> **Status: in progress.** The App Service half is blocked on an Azure subscription quota limit
-> (see [Quota constraint](#quota-constraint)). Everything else is built and working.
+Built on a personal Pay-As-You-Go subscription, deliberately kept to roughly 55p per day, then torn
+down.
 
 ---
 
 ## Architecture
 
 ```
-                         Internet
-                            │
-                            ▼
-              ┌──────────────────────────┐
-              │  App Service (B1, Linux) │   ← pending quota
-              │  app-lab-hammad-01       │
-              │  Python 3.12             │
-              └────────────┬─────────────┘
-                           │ VNet integration
-   vnet-lab  10.0.0.0/16   │
-   ┌───────────────────────┼────────────────────────┐
-   │                       ▼                        │
-   │   snet-web  10.0.1.0/24                        │
-   │                                                │
-   │   snet-data 10.0.2.0/24                        │
-   │        │                                       │
-   │        ▼  private endpoint (deferred - hourly) │
-   └────────┼───────────────────────────────────────┘
-            ▼
-   ┌────────────────────────────┐     ┌─────────────────────────┐
-   │ Azure SQL (serverless)     │     │ Key Vault (RBAC)        │
-   │ sql-lab-hammad-01          │     │ kv-lab-hammad-01        │
-   │ sqldb-lab                  │◄────┤ SqlConnectionString     │
-   └────────────────────────────┘     └─────────────────────────┘
+                    Internet
+                       |
+                       v
+        +------------------------------+
+        |   App Service (Linux, B1)    |
+        |   app-lab-hammad-01          |
+        |   system-assigned identity   |
+        +------------------------------+
+                 |                |
+      VNet integration        Key Vault reference
+      (snet-web)              (managed identity auth)
+                 |                |
+                 v                v
+   +----------------------+  +----------------------+
+   | Private endpoint     |  | Key Vault            |
+   | pe-sql-lab           |  | kv-lab-hammad-01     |
+   | snet-data  10.0.2.4  |  | RBAC, Secrets User   |
+   +----------------------+  +----------------------+
+                 |
+                 v
+     +-------------------------+
+     | Azure SQL (serverless)  |
+     | public access DISABLED  |
+     +-------------------------+
+
+   vnet-lab 10.0.0.0/16
+     snet-web   10.0.1.0/24  (delegated to App Service)
+     snet-data  10.0.2.0/24  (private subnet, no default outbound)
 ```
 
 ---
 
-## What is built
+## Resources
 
 | Resource | Name | Notes |
 |---|---|---|
-| Resource group | `rg-lab-uksouth` | Everything lives here, so teardown is one action |
+| Resource group | `rg-lab-uksouth` | UK South, one group so teardown is a single command |
+| App Service plan | `ASP-rglabuksouth-909b` | B1 Linux — Basic is the minimum tier for VNet integration |
+| Web app | `app-lab-hammad-01` | Python 3.12, basic authentication disabled |
 | Virtual network | `vnet-lab` | 10.0.0.0/16 |
-| Subnet (web tier) | `snet-web` | 10.0.1.0/24, default outbound access enabled |
-| Subnet (data tier) | `snet-data` | 10.0.2.0/24, private subnet - no default outbound |
-| SQL logical server | `sql-lab-hammad-01` | SQL + Microsoft Entra authentication |
-| SQL database | `sqldb-lab` | General Purpose serverless, free offer, auto-pause |
+| Subnets | `snet-web`, `snet-data` | Web tier delegated to App Service; data tier private |
+| Private endpoint | `pe-sql-lab` | Target sub-resource `sqlServer`, private IP 10.0.2.4 |
+| Private DNS zone | `privatelink.database.windows.net` | Linked to `vnet-lab` |
+| SQL server / database | `sql-lab-hammad-01` / `sqldb-lab` | General Purpose Serverless, free offer |
 | Key Vault | `kv-lab-hammad-01` | Azure RBAC permission model |
-| Budget | `lab-budget` | £5/month with alerts at 50/80/100% actual and 100% forecast |
+| Monitoring | Application Insights, alert `alert-5xx` | Action group `ag-lab-email` |
+| Budget | `lan-budget` | £5/month, alert-only |
 
-### Network segmentation
+---
 
-A `/16` address space split into two `/24` subnets, divided by exposure rather than by convenience.
-The web tier accepts traffic from the internet; the data tier must not. Separating them means
-network rules can be applied at the subnet boundary, and it gives the SQL private endpoint somewhere
-to live where nothing else can reach it.
+## Network segmentation
 
-`snet-data` is configured as a **private subnet** (no default outbound internet access), because the
-only thing that will ever sit in it is a private endpoint, which needs no egress. `snet-web` keeps
-default outbound access, because removing it would require a NAT gateway for the App Service to
-reach the internet.
+The virtual network splits the tiers so they have different exposure. `snet-web` carries the App
+Service integration; `snet-data` holds only the database's private endpoint and is a private subnet
+with no default outbound access.
 
-Each `/24` provides 251 usable addresses, not 256 — Azure reserves the first four and the last one
-in every subnet.
+The web app was integrated into `snet-web` with **route-all outbound traffic** enabled. That setting
+matters more than it appears: without it the app's outbound traffic bypasses the virtual network, so
+it would neither resolve nor reach the private endpoint.
 
-### Database
+A private endpoint (`pe-sql-lab`) was then created for the SQL server in `snet-data`, with private DNS
+integration. The zone `privatelink.database.windows.net` overrides the public hostname for anything
+inside the VNet.
 
-`sqldb-lab` runs on the **General Purpose serverless** tier under Azure SQL's free offer:
-100,000 vCore-seconds, 32 GB data and 32 GB backup storage per month.
+**Verification** — from the app's own SSH console:
 
-Two settings do the cost control:
-
-- **Auto-pause after 1 hour idle.** Serverless bills per vCore-second of actual activity, so a
-  paused database costs nothing for compute. The trade-off is a cold start of a few seconds on the
-  first query after a pause — acceptable for a lab, not acceptable for a customer-facing app. That
-  trade-off is the reason serverless is not a universal default.
-- **Overage billing disabled.** When the free monthly allowance is exhausted the database pauses
-  until the next month rather than falling through to paid rates. This is the only genuine hard
-  cost stop available on a pay-as-you-go subscription.
-
-Schema:
-
-```sql
-CREATE TABLE dbo.Messages (
-    MessageId   INT IDENTITY(1,1) PRIMARY KEY,
-    Body        NVARCHAR(200) NOT NULL,
-    CreatedUtc  DATETIME2(0)  NOT NULL
-        CONSTRAINT DF_Messages_CreatedUtc DEFAULT SYSUTCDATETIME()
-);
+```bash
+python -c "import socket; print(socket.gethostbyname('sql-lab-hammad-01.database.windows.net'))"
+10.0.2.4
 ```
 
-Encryption is on by default in both directions: Transparent Data Encryption at rest with a
-service-managed key, and TLS in transit (`Encrypt=True` in the connection string).
+The public hostname resolves to a private address inside `snet-data`, so the traffic never leaves the
+virtual network.
 
-### Secrets
+With that proven, **public network access on the SQL server was disabled**. The existing firewall
+rules are retained but inert — the point being that the private endpoint, not an IP allow-list, is
+what now protects the database. The trade-off is real: the portal Query editor and any desktop SQL
+client can no longer reach it, which is the correct behaviour for a database that should only be
+reachable from its application tier.
 
-Key Vault uses the **Azure RBAC** permission model rather than the legacy vault access policies.
+### Why a private endpoint rather than a firewall rule
 
-An important distinction this makes concrete: being subscription **Owner** is a control-plane role.
-It permits deleting the vault but not reading what is inside it. Data-plane access is a separate
-role assignment — `Key Vault Secrets Officer` to read and write, `Key Vault Secrets User` to read
-only. The App Service's managed identity will be granted **Secrets User**, because an application
-that only needs to fetch a connection string has no business being able to overwrite it.
+A server-level firewall rule still exposes a public endpoint and depends on an accurate, maintained
+allow-list — which breaks the moment a home ISP rotates an address. A private endpoint removes the
+public surface altogether, replacing "who is allowed to connect" with "what can route to it at all".
 
-The SQL connection string is stored as the secret `SqlConnectionString` rather than in application
-configuration.
+---
 
-**Intended end state:** Azure SQL also offers Entra passwordless authentication
-(`Authentication="Active Directory Default"`), where the App Service's managed identity is a SQL
-user and the connection string contains no credential at all. That is strictly better than storing
-a password well — there is nothing to leak and nothing to rotate. The Key Vault path is implemented
-here first because the mechanics are worth knowing.
+## Identity and secrets
+
+The database credential is stored as the `SqlConnectionString` secret in Key Vault, which uses the
+**Azure RBAC permission model** rather than legacy access policies.
+
+A distinction worth recording, because it caused a genuine failure here: being **Owner** of the vault
+does not grant the ability to read a secret. Owner is a control-plane role governing management of the
+vault itself. Reading a secret value is a data-plane operation requiring a role such as Key Vault
+Secrets Officer or Secrets User. Separating the two is the entire point of the RBAC model.
+
+The app was given a **system-assigned managed identity**, whose lifecycle is tied to the app — delete
+the app and the principal goes with it, leaving no orphaned credential. That identity was granted
+**Key Vault Secrets User**, deliberately not Secrets Officer: an application that only fetches a
+connection string should not be able to overwrite or delete it.
+
+The app setting then holds a reference rather than a value:
+
+```
+SqlConnectionString = @Microsoft.KeyVault(SecretUri=https://kv-lab-hammad-01.vault.azure.net/secrets/SqlConnectionString/)
+```
+
+The trailing slash makes the reference versionless, so rotating the secret is picked up automatically
+instead of leaving the app pointed at a dead version. The portal confirms resolution by showing the
+setting's source as **Key vault** with a green tick — meaning the identity authenticated, was
+authorised, and read the secret successfully.
+
+Net result: no password, key or connection string is stored anywhere in the application's
+configuration or source.
 
 ---
 
 ## Cost control
 
-Pay-as-you-go subscriptions have **no hard spending limit**. The Azure spending limit feature exists
-only on credit-based subscriptions, and Cost Management budgets are alerts, not caps — and they lag
-several hours behind actual usage, so they catch a slow leak rather than a spike.
+This ran on Pay-As-You-Go, which has **no hard spending limit**. Budgets raise alerts; they do not
+stop spend, and they lag by hours. Cost control therefore had to come from resource choices:
 
-Real cost control here comes from three things:
+- **Azure SQL serverless on the free offer** — 100,000 vCore-seconds and 32 GB storage per month, with
+  **overage billing disabled** so the database pauses rather than bills. The only genuine hard stop in
+  the environment.
+- **Auto-pause** after one hour idle.
+- **B1 App Service plan**, roughly 40p/day. App Service plans bill whether the app is running or
+  stopped — stopping the app saves nothing, which is a common and expensive misunderstanding.
+- **Private endpoint**, roughly 13p/day, created only when the networking work was actually being done
+  rather than left running during study time.
+- Microsoft Defender for SQL left off; it bills per server and adds nothing to a lab.
 
-1. Free-tier and serverless SKUs wherever possible, with overage billing disabled on the database.
-2. Understanding what bills continuously. An App Service Plan charges whether the app inside it is
-   running or stopped — stopping the app does not stop the bill, only deleting the plan does.
-3. A single resource group, so teardown is one action.
-
-The private endpoint is **deliberately deferred**. It bills hourly (roughly £6/month) whether or not
-anything is using it, so it will be created at the end, demonstrated, screenshotted, and removed
-with the rest of the environment rather than left running while other work is blocked.
-
-Spend at time of writing: **£0.00**.
+Total running cost was about 55p per day, and the environment was deleted once documented.
 
 ---
 
-## Quota constraint
+## Diagnosing a zero App Service quota
 
-App Service deployment is currently blocked by a subscription-level quota limit. Every attempt to
-create an App Service Plan fails with:
+The first deployment failed with `Current Limit (B1 VMs): 0` — a new PAYG subscription had no App
+Service quota at all, in UK South or North Europe.
 
-```
-Operation cannot be completed without additional quota.
-Current Limit (B1 VMs): 0
-Current Usage: 0
-Amount required for this deployment (B1 VMs): 1
-```
+Three things worth recording:
 
-Diagnosis: the limit is **0 for every SKU tested** — F1, B1 and P0V3 — and in more than one region.
-New pay-as-you-go subscriptions ship this way as an anti-abuse measure. It is not a billing problem,
-and no change of tier or region resolves it.
+1. **Review + create validation does not check quota.** Validation passed every time; only pressing
+   Create surfaced the real limit. Passing validation is not evidence that a deployment will succeed.
+2. **The support request category determines whether anyone can help.** The first ticket, filed under
+   "Other Requests", went nowhere for four days. The correct path is
+   Quotas → *Function or Web App (Windows and Linux)*. The intake form requires a zone-redundant
+   deployment type even when the actual deployment is not zone-redundant.
+3. **AI assistance misdiagnosed it** as an ARM template preflight problem. The literal error text was
+   correct and specific; the quota really was zero.
 
-Two things worth recording:
-
-- The portal's **Review + create** validation does not check quota. A clean validation screen proves
-  nothing; the error only appears after pressing Create. This caused two false positives before it
-  was understood.
-- Azure Copilot misdiagnosed the failure as an ARM template preflight error and recommended
-  `az deployment group validate`. The actual error text names the SKU, the region's limit and the
-  current usage explicitly. Reading the literal error beat following the suggested cause.
-
-Resolution in progress via Microsoft support (quota increase request, correctly categorised under
-*Service and Subscription Limits (Quotas) → Function or Web App (Windows and Linux)* after an initial
-mis-filing).
+The second ticket was closed ten minutes after it was raised, with no explanation. The grant was only
+discoverable by retrying the deployment.
 
 ---
 
-## Still to build
+## Deployment pipeline
 
-- App Service (B1, Linux, Python) with Application Insights and an alert rule on HTTP 5xx
-- Regional VNet integration into `snet-web`
-- Private endpoint for SQL in `snet-data`, then disable the database's public endpoint
-- Managed identity on the App Service, granted `Key Vault Secrets User`, reading the connection
-  string via a Key Vault reference so no credential sits in app configuration
-- A second identity with `Reader` on the resource group, to demonstrate least-privilege role
-  assignment
-- GitHub Actions deployment pipeline, ideally using OIDC federated credentials rather than a stored
-  publish profile
+Deployment is handled by GitHub Actions, configured through the App Service Deployment Center, with
+the workflow committed to `.github/workflows/master_app-lab-hammad-01.yml`.
+
+Authentication uses a **user-assigned managed identity federated with GitHub** rather than a stored
+publish profile. Azure registers a federated credential trusting GitHub's token issuer for this
+specific repository and branch; the workflow requests a short-lived token at deploy time and Azure
+validates it against that trust. No secret is stored in GitHub, which matters here because basic
+authentication is disabled on the app.
+
+Two identity types are in play, doing different jobs:
+
+| Identity | Type | Purpose |
+|---|---|---|
+| App's own identity | System-assigned | The app proving itself to Key Vault |
+| Pipeline identity | User-assigned, federated | GitHub proving itself to Azure at deploy time |
+
+### A deployment that succeeded while the app stayed down
+
+The first successful pipeline run left the site serving Azure's default placeholder page. The
+deployment genuinely had succeeded — the failure was downstream of it.
+
+The previous method (`az webapp deployment source config --manual-integration`) pulled the repo and
+ran Azure's Oryx build on the server, which installed the dependencies in `requirements.txt`. The
+GitHub Actions workflow instead packages the repo and pushes it, and by default the platform does not
+build on arrival. So `app.py` was present, Flask was not installed, gunicorn could not start the
+application, and App Service fell back to the placeholder page.
+
+Fixed by setting `SCM_DO_BUILD_DURING_DEPLOYMENT=true` so the platform builds the deployed package.
+
+The lesson worth keeping: a green pipeline means the artifact arrived, not that the application runs.
+Those are separate claims and need separate verification.
+
+---
+
+## Infrastructure as code
+
+`/terraform` expresses the same environment as code: virtual network and subnets, the serverless
+database with `use_free_limit` and overage disabled, Key Vault with RBAC, and outputs.
+
+The portal build came first, deliberately — the aim was to understand each resource and its failure
+modes before automating it. The Terraform is provided for review with `terraform init` and
+`terraform plan`; it was not used to apply this environment.
+
+Secrets are kept out of state: `terraform.tfvars`, `*.tfstate` and `.terraform/` are gitignored, since
+local state stores values in clear text.
 
 ---
 
 ## Teardown
 
-```
+```bash
 az group delete --name rg-lab-uksouth --yes
 ```
 
-One command removes every resource above.
+Keeping everything in one resource group is what makes cleanup a single command.
+
+---
+
+## Screenshots
+
+| File | Shows |
+|---|---|
+| `docs/01-resource-group.png` | All resources in `rg-lab-uksouth` |
+| `docs/02-subnets.png` | `snet-web` and `snet-data` |
+| `docs/03-vnet-integration.png` | App Service integrated into `snet-web` |
+| `docs/04-private-endpoint.png` | `pe-sql-lab` approved |
+| `docs/05-public-access-disabled.png` | SQL public network access disabled |
+| `docs/06-private-dns-resolution.png` | Hostname resolving to 10.0.2.4 from inside the app |
+| `docs/07-managed-identity.png` | System-assigned identity enabled |
+| `docs/08-role-assignment.png` | Key Vault Secrets User granted to the app |
+| `docs/09-keyvault-reference.png` | App setting sourced from Key vault |
+| `docs/10-app-live.png` | The running application |
+| `docs/11-actions-run.png` | Successful GitHub Actions run (build and deploy) |
+| `docs/12-deployment-center.png` | Deployment Center configured with federated identity |
+| `docs/13-deployed-change.png` | A pushed change live on the site |
